@@ -180,7 +180,9 @@ jobs:
           Expand-Archive $pkg.FullName $unzip
           $nuspec = [xml](Get-Content (Get-ChildItem $unzip -Filter *.nuspec).FullName)
           if ($nuspec.package.metadata.id -ne $env:PACKAGE_ID) { throw "nuspec id is '$($nuspec.package.metadata.id)'." }
-          if ($nuspec.package.metadata.version -ne $env:PACKAGE_VERSION) { throw "nuspec version is '$($nuspec.package.metadata.version)'." }
+          # NuGet normalises a zero fourth part away (3.8.0.0-dryrun.2 -> 3.8.0-dryrun.2).
+          $expectedVersion = $env:PACKAGE_VERSION -replace '^(\d+\.\d+\.\d+)\.0(-.*)?$', '$1$2'
+          if ($nuspec.package.metadata.version -ne $expectedVersion) { throw "nuspec version is '$($nuspec.package.metadata.version)', expected $expectedVersion." }
           $dlls = @(Get-ChildItem (Join-Path $unzip 'lib') -Recurse -Filter ACadSharp.dll)
           if ($dlls.Count -eq 0) { throw "No ACadSharp.dll under lib/." }
           foreach ($dll in $dlls) {
