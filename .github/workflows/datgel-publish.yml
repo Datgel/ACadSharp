@@ -160,8 +160,12 @@ jobs:
           if ($LASTEXITCODE) { throw "tests failed ($LASTEXITCODE)" }
 
       - name: Pack
+        # Build, then pack the built assemblies: the project's own GeneratePackageOnBuild (Release) is turned off, or a
+        # pack that builds again cannot find the files it packs (NU5026, measured on a dev box).
         run: |
-          dotnet pack $env:PROJECT -c Release -o artifacts `
+          dotnet build $env:PROJECT -c Release -p:GeneratePackageOnBuild=false -p:Version=$env:PACKAGE_VERSION
+          if ($LASTEXITCODE) { throw "build failed ($LASTEXITCODE)" }
+          dotnet pack $env:PROJECT -c Release --no-build -o artifacts -p:GeneratePackageOnBuild=false `
             -p:PackageId=$env:PACKAGE_ID -p:Version=$env:PACKAGE_VERSION -p:RepositoryUrl=$env:REPOSITORY_URL
           if ($LASTEXITCODE) { throw "pack failed ($LASTEXITCODE)" }
 
@@ -176,7 +180,9 @@ jobs:
           Expand-Archive $pkg.FullName $unzip
           $nuspec = [xml](Get-Content (Get-ChildItem $unzip -Filter *.nuspec).FullName)
           if ($nuspec.package.metadata.id -ne $env:PACKAGE_ID) { throw "nuspec id is '$($nuspec.package.metadata.id)'." }
-          if ($nuspec.package.metadata.version -ne $env:PACKAGE_VERSION) { throw "nuspec version is '$($nuspec.package.metadata.version)'." }
+          # NuGet normalises a zero fourth part away (3.8.0.0-dryrun.2 -> 3.8.0-dryrun.2).
+          $expectedVersion = $env:PACKAGE_VERSION -replace '^(\d+\.\d+\.\d+)\.0(-.*)?$', '$1$2'
+          if ($nuspec.package.metadata.version -ne $expectedVersion) { throw "nuspec version is '$($nuspec.package.metadata.version)', expected $expectedVersion." }
           $dlls = @(Get-ChildItem (Join-Path $unzip 'lib') -Recurse -Filter ACadSharp.dll)
           if ($dlls.Count -eq 0) { throw "No ACadSharp.dll under lib/." }
           foreach ($dll in $dlls) {
