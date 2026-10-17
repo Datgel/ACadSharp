@@ -160,8 +160,12 @@ jobs:
           if ($LASTEXITCODE) { throw "tests failed ($LASTEXITCODE)" }
 
       - name: Pack
+        # Build, then pack the built assemblies: the project's own GeneratePackageOnBuild (Release) is turned off, or a
+        # pack that builds again cannot find the files it packs (NU5026, measured on a dev box).
         run: |
-          dotnet pack $env:PROJECT -c Release -o artifacts `
+          dotnet build $env:PROJECT -c Release -p:GeneratePackageOnBuild=false -p:Version=$env:PACKAGE_VERSION
+          if ($LASTEXITCODE) { throw "build failed ($LASTEXITCODE)" }
+          dotnet pack $env:PROJECT -c Release --no-build -o artifacts -p:GeneratePackageOnBuild=false `
             -p:PackageId=$env:PACKAGE_ID -p:Version=$env:PACKAGE_VERSION -p:RepositoryUrl=$env:REPOSITORY_URL
           if ($LASTEXITCODE) { throw "pack failed ($LASTEXITCODE)" }
 
