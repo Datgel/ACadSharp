@@ -1,0 +1,204 @@
+name: datgel-publish
+
+run-name: "${{ github.event_name == 'push' && format('Publish {0}', github.ref_name) || (github.event_name == 'workflow_dispatch' && inputs.push && format('Publish {0} from {1}', inputs.version, github.ref_name)) || format('Dry run - test and pack Datgel.ACadSharp from {0}', github.head_ref || github.ref_name) }}"
+
+# -----------------------------------------------------------------------------
+# DH-3316 - test, pack and publish the Datgel fork of ACadSharp as Datgel.ACadSharp to the
+# internal datgel-github NuGet feed (https://nuget.pkg.github.com/Datgel/index.json), which
+# Datgel.Hub restores from. The same mechanism as Datgel/WinUI.TableView's datgel-publish.yml
+# (DH-2508): Hub consumes the fork under a Datgel package id until the change is upstream.
+#
+#   push tag datgel-v<version>      THE RELEASE. e.g. datgel-v3.8.0.1. Tests and packs the tagged
+#                                   commit at exactly that version and pushes it.
+#   workflow_dispatch               version + push inputs. push=false (default) is a DRY RUN on any
+#                                   branch; push=true publishes, and only from the
+#                                   datgel/v<X.Y.Z>-patched branch the version belongs to.
+#   pull_request -> datgel/v*-patched   DRY RUN of the PR head (tests + pack + content checks).
+#
+# Versions are EXPLICIT, never guessed. A version already on the feed is refused before anything
+# is built (GitHub Packages never overwrites a version; a race that loses is a 409 and fails the
+# push - no --skip-duplicate). The tag namespace is datgel-v*, NOT v*: upstream releases use v*.
+#
+# The assembly keeps upstream's name (ACadSharp.dll), namespaces and strong-name key
+# (src/ACadSharp.snk), so Hub's code is unchanged when the package id moves back to upstream's
+# ACadSharp; only the package id differs.
+#
+# RUNNER: GitHub-hosted windows-latest, deliberately (Datgel's rule is the DGSGLT14 pool). This
+# fork is PUBLIC and no Datgel org runner group allows public repositories, so a self-hosted job
+# would queue for 24 h and die; hosted minutes are free for a public repository. Hosted VMs are
+# fresh: setup-dotnet is fine here, and there is no actions/cache.
+#
+# AUTH: GITHUB_TOKEN with packages: write. The first publish creates the package linked to this
+# repository (the nuspec repository URL); later pushes inherit write through that link.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    tags:
+      - 'datgel-v*'
+  pull_request:
+    branches:
+      - 'datgel/v*-patched'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version, 4 parts (e.g. 3.8.0.1, or 3.8.0.1-dh3316.1). Must not exist on the feed."
+        required: true
+        type: string
+      push:
+        description: "Publish to datgel-github. Leave OFF for a dry run (test + pack + verify, nothing pushed)."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: datgel-publish-${{ github.event_name == 'pull_request' && github.head_ref || 'feed' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PACKAGE_ID: Datgel.ACadSharp
+  FEED_URL: https://nuget.pkg.github.com/Datgel/index.json
+  REPOSITORY_URL: https://github.com/Datgel/ACadSharp
+  PROJECT: src/ACadSharp/ACadSharp.csproj
+  TESTS: src/ACadSharp.Tests/ACadSharp.Tests.csproj
+  # The token of upstream's src/ACadSharp.snk (the assembly identity is upstream's).
+  PUBLIC_KEY_TOKEN: 835670d357149d36
+
+jobs:
+  pack:
+    name: "Test, pack (and publish on a release)"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      FEED_USER: ${{ github.actor }}
+      FEED_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Resolve version and mode (refuse anything ambiguous)
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_PUSH: ${{ inputs.push }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $versionPattern = '^(\d+)\.(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          switch ($env:EVENT) {
+            'push' {
+              if ($env:REF_NAME -notmatch '^datgel-v(.+)$') { throw "Tag '$env:REF_NAME' is not datgel-v<version>." }
+              $version = $Matches[1]; $publish = $true
+            }
+            'workflow_dispatch' { $version = $env:IN_VERSION.Trim(); $publish = ($env:IN_PUSH -eq 'true') }
+            'pull_request' {
+              if ($env:BASE_REF -notmatch '^datgel/v(\d+\.\d+\.\d+)-patched$') { throw "PR base '$env:BASE_REF' is not a datgel/v<X.Y.Z>-patched branch." }
+              $version = "$($Matches[1]).0-dryrun.$env:RUN_NUMBER"; $publish = $false
+            }
+            default { throw "Unexpected event $env:EVENT." }
+          }
+          if ($version -notmatch $versionPattern) { throw "Version '$version' is not 4-part (Major.Minor.Build.Revision[-prerelease])." }
+          $line = "datgel/v$($Matches[1]).$($Matches[2]).$($Matches[3])-patched"
+          if ($publish) {
+            git fetch origin "+refs/heads/${line}:refs/remotes/origin/$line" --quiet
+            if ($LASTEXITCODE) { throw "Branch $line does not exist on origin - version $version names no patched line." }
+            if ($env:EVENT -eq 'workflow_dispatch' -and $env:REF_NAME -ne $line) { throw "push=true from '$env:REF_NAME' refused: $version may only be published from $line." }
+            $sha = (git rev-parse HEAD).Trim()
+            git merge-base --is-ancestor $sha "origin/$line"
+            $rc = $LASTEXITCODE
+            if ($rc -eq 1) { throw "Commit $sha is NOT on $line - refusing to publish an unmerged commit as $version." }
+            if ($rc -ne 0) { throw "git merge-base failed ($rc) - cannot verify ancestry; refusing to publish." }
+          }
+          Write-Host "Version: $version   Publish: $publish   Line: $line"
+          "PACKAGE_VERSION=$version" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "PUBLISH=$publish"         | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Refuse a version already on the feed
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $auth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:FEED_USER):$($env:FEED_TOKEN)"))
+          $id = $env:PACKAGE_ID.ToLowerInvariant()
+          $versions = @()
+          try {
+            $index = Invoke-RestMethod "https://nuget.pkg.github.com/Datgel/download/$id/index.json" -Headers @{ Authorization = $auth }
+            $versions = @($index.versions)
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+            Write-Host "$env:PACKAGE_ID is not on the feed yet (first publish)."
+          }
+          Write-Host "On the feed now ($($versions.Count)): $($versions -join ', ')"
+          if ($versions -contains $env:PACKAGE_VERSION.ToLowerInvariant()) {
+            if ($env:PUBLISH -eq 'True') { throw "$env:PACKAGE_ID $env:PACKAGE_VERSION is ALREADY on the feed - versions are immutable; choose the next one." }
+            Write-Host "::warning::$env:PACKAGE_VERSION is already on the feed (dry run, so not fatal)."
+          }
+
+      - name: Setup .NET SDKs (hosted VM only)
+        uses: actions/setup-dotnet@v5.0.1
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Test (net9.0)
+        # WriterSingleObjectTests is left out: 17 of its cases (GeoData, InsertWithSpatialFilter in DXF; SingleMLeader in
+        # DWG) fail on upstream's own v3.8.0 tag too (measured 2026-10-17), so they would make every run red.
+        run: |
+          dotnet test $env:TESTS -c Release -f net9.0 -p:TargetFrameworks=net9.0 --filter "FullyQualifiedName!~WriterSingleObjectTests"
+          if ($LASTEXITCODE) { throw "tests failed ($LASTEXITCODE)" }
+
+      - name: Pack
+        run: |
+          dotnet pack $env:PROJECT -c Release -o artifacts `
+            -p:PackageId=$env:PACKAGE_ID -p:Version=$env:PACKAGE_VERSION -p:RepositoryUrl=$env:REPOSITORY_URL
+          if ($LASTEXITCODE) { throw "pack failed ($LASTEXITCODE)" }
+
+      - name: Check the package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkgs = @(Get-ChildItem artifacts -Filter "$($env:PACKAGE_ID).*.nupkg" | Where-Object { $_.Name -notmatch '\.snupkg$' })
+          if ($pkgs.Count -ne 1) { throw "Expected one $env:PACKAGE_ID .nupkg, found $($pkgs.Count): $($pkgs.Name -join ', ')" }
+          $pkg = $pkgs[0]
+          $unzip = Join-Path $env:RUNNER_TEMP 'pkg'
+          Remove-Item $unzip -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive $pkg.FullName $unzip
+          $nuspec = [xml](Get-Content (Get-ChildItem $unzip -Filter *.nuspec).FullName)
+          if ($nuspec.package.metadata.id -ne $env:PACKAGE_ID) { throw "nuspec id is '$($nuspec.package.metadata.id)'." }
+          if ($nuspec.package.metadata.version -ne $env:PACKAGE_VERSION) { throw "nuspec version is '$($nuspec.package.metadata.version)'." }
+          $dlls = @(Get-ChildItem (Join-Path $unzip 'lib') -Recurse -Filter ACadSharp.dll)
+          if ($dlls.Count -eq 0) { throw "No ACadSharp.dll under lib/." }
+          foreach ($dll in $dlls) {
+            $token = -join ([System.Reflection.AssemblyName]::GetAssemblyName($dll.FullName).GetPublicKeyToken() | ForEach-Object { $_.ToString('x2') })
+            if ($token -ne $env:PUBLIC_KEY_TOKEN) { throw "$($dll.FullName) has public key token '$token', expected $env:PUBLIC_KEY_TOKEN." }
+            Write-Host "Strong-named: $($dll.FullName.Substring($unzip.Length)) ($token)"
+          }
+          $hash = (Get-FileHash $pkg.FullName -Algorithm SHA256).Hash
+          Write-Host "Packed $($pkg.Name)  SHA-256 $hash"
+          "PACKAGE_PATH=$($pkg.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_ID }}.${{ env.PACKAGE_VERSION }}
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Push to datgel-github
+        if: env.PUBLISH == 'True'
+        run: |
+          dotnet nuget push $env:PACKAGE_PATH --source $env:FEED_URL --api-key $env:FEED_TOKEN
+          if ($LASTEXITCODE) { throw "push failed ($LASTEXITCODE)" }
+          "### Published $env:PACKAGE_ID $env:PACKAGE_VERSION`n`nBump Hub's pin in ``Directory.Packages.props``." | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
